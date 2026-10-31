@@ -1,0 +1,8 @@
+# HTTP and SOCKS5 share this port (listen on all IPv4 interfaces).
+listen 7898
+
+# Clash Verge HTTP or mixed proxy port.
+upstream 127.0.0.1:7897
+
+user alice change-me
+user bob "another password"
