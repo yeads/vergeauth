@@ -381,6 +381,19 @@ class Integration(unittest.TestCase):
             sock.shutdown(socket.SHUT_WR)
             self.assertEqual(recv_all(sock), b"after-fin:last-data")
 
+    def test_rejected_http_drains_late_input(self):
+        with self.proxy.connect() as sock:
+            sock.sendall(b"GET / HTTP/1.1\r\nX-Large: " + b"a" * 66000)
+            response = recv_headers(sock)
+            self.assertTrue(response.startswith(b"HTTP/1.1 431 "), response)
+            self.assertIn(b"Content-Length: 0\r\n", response)
+            self.assertIn(b"Connection: close\r\n", response)
+            # The peer may still be sending when it receives the error response.
+            sock.sendall(b"b" * (1024 * 1024))
+            sock.shutdown(socket.SHUT_WR)
+            self.assertEqual(recv_all(sock), b"")
+        self.assertTrue(self.upstream.requests.empty())
+
     def test_socks_authentication_errors(self):
         with self.proxy.connect() as sock:
             sock.sendall(b"\x05\x01\x00")

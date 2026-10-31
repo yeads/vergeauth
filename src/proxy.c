@@ -29,6 +29,7 @@ struct connection {
     struct server *server;
     struct connection *next, *prev;
     struct bufferevent *client, *upstream;
+    struct event *close_timer;
     struct http_message request, response;
     enum state state;
     int socks, connect_method, response_started, interim_count;
@@ -58,6 +59,7 @@ static void connection_free(struct connection *c)
     else c->server->connections = c->next;
     if (c->next) c->next->prev = c->prev;
     --c->server->connection_count;
+    if (c->close_timer) event_free(c->close_timer);
     if (c->client) bufferevent_free(c->client);
     if (c->upstream) bufferevent_free(c->upstream);
     http_free(&c->request);
@@ -65,16 +67,41 @@ static void connection_free(struct connection *c)
     free(c);
 }
 
-/* Drain the client output before destruction, including authentication errors. */
+static void close_timeout(evutil_socket_t fd, short events, void *arg)
+{
+    (void)fd; (void)events;
+    connection_free(arg);
+}
+
+static void finish_write(struct connection *c)
+{
+    struct timeval timeout = {10, 0};
+    if (evbuffer_get_length(bufferevent_get_output(c->client))) return;
+    if (!c->client_shutdown) {
+        shutdown(bufferevent_getfd(c->client), SHUT_WR);
+        c->client_shutdown = 1;
+    }
+    if (c->client_eof) { connection_free(c); return; }
+    /* Start the drain deadline only after the response has finished writing. */
+    if (!evtimer_pending(c->close_timer, NULL) && evtimer_add(c->close_timer, &timeout))
+        connection_free(c);
+}
+
+/* Half-close after flushing the response, then drain input to avoid a TCP RST. */
 static void finish(struct connection *c)
 {
     struct timeval timeout = {10, 0};
+    struct evbuffer *in = bufferevent_get_input(c->client);
+    if (c->state == CLOSING) return;
     c->state = CLOSING;
     if (c->upstream) { bufferevent_free(c->upstream); c->upstream = NULL; }
-    bufferevent_disable(c->client, EV_READ);
+    c->close_timer = evtimer_new(c->server->base, close_timeout, c);
+    if (!c->close_timer) { connection_free(c); return; }
+    evbuffer_drain(in, evbuffer_get_length(in));
     bufferevent_setwatermark(c->client, EV_WRITE, 0, 0);
     bufferevent_set_timeouts(c->client, NULL, &timeout);
-    if (!evbuffer_get_length(bufferevent_get_output(c->client))) connection_free(c);
+    if (!c->client_eof) bufferevent_enable(c->client, EV_READ);
+    finish_write(c);
 }
 
 static void http_error(struct connection *c, int code, const char *reason)
@@ -306,6 +333,11 @@ static int transfer_body(struct bufferevent *source, struct bufferevent *destina
 static void client_read(struct bufferevent *bev, void *arg)
 {
     struct connection *c = arg;
+    if (c->state == CLOSING) {
+        struct evbuffer *in = bufferevent_get_input(bev);
+        evbuffer_drain(in, evbuffer_get_length(in));
+        return;
+    }
     if (c->state == DETECT) {
         unsigned char first;
         if (evbuffer_copyout(bufferevent_get_input(bev), &first, 1) != 1) return;
@@ -395,8 +427,9 @@ static void upstream_read(struct bufferevent *bev, void *arg)
 static void client_write(struct bufferevent *bev, void *arg)
 {
     struct connection *c = arg;
+    (void)bev;
     if (c->state == CLOSING) {
-        if (!evbuffer_get_length(bufferevent_get_output(bev))) connection_free(c);
+        finish_write(c);
         return;
     }
     if ((c->state == TUNNEL || c->state == HTTP_EXCHANGE) && c->upstream) {
@@ -424,7 +457,8 @@ static void client_event(struct bufferevent *bev, short events, void *arg)
         c->client_eof = 1;
         bufferevent_disable(bev, EV_READ);
         if (c->state == TUNNEL || c->state == HTTP_EXCHANGE) client_read(bev, c);
-        else if (c->state != CONNECTING && c->state != CONNECT_RESPONSE && c->state != CLOSING)
+        else if (c->state == CLOSING) finish_write(c);
+        else if (c->state != CONNECTING && c->state != CONNECT_RESPONSE)
             connection_free(c);
     }
 }

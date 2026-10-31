@@ -135,6 +135,15 @@ static void request(const char *method, const char *target, const char *auth, co
     pump();
 }
 
+static void expect_graceful_close(void)
+{
+    CHECK(server.connections && server.connections->state == CLOSING);
+    CHECK(server.connections->client_shutdown);
+    bufferevent_trigger_event(server.connections->client, BEV_EVENT_EOF, BEV_TRIG_DEFER_CALLBACKS);
+    pump();
+    CHECK(!server.connections);
+}
+
 static void test_http_auth(void)
 {
     const char *invalid[] = {
@@ -157,7 +166,7 @@ static void test_http_auth(void)
     expect_text(upstream_peer, "GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer origin\r\nConnection: close\r\n\r\n");
     send_text(upstream_peer, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok");
     expect_text(client_peer, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-    CHECK(!server.connections);
+    expect_graceful_close();
     teardown();
 }
 
@@ -189,7 +198,7 @@ static void test_http_framing(void)
     request("HEAD", "http://example.test/", authorization, "");
     send_text(upstream_peer, "HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n");
     expect_text(client_peer, "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nConnection: close\r\n\r\n");
-    CHECK(!server.connections);
+    expect_graceful_close();
     teardown();
 
     setup();
@@ -199,7 +208,7 @@ static void test_http_framing(void)
     bufferevent_trigger_event(server.connections->upstream, BEV_EVENT_EOF, BEV_TRIG_DEFER_CALLBACKS);
     pump();
     expect_text(client_peer, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\neof-body");
-    CHECK(!server.connections);
+    expect_graceful_close();
     teardown();
 }
 
@@ -262,6 +271,54 @@ static void test_http_tunnel(void)
     request("CONNECT", "example.test:443", authorization, "");
     send_text(upstream_peer, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
     expect_status(client_peer, "HTTP/1.1 502 ");
+    teardown();
+}
+
+static void test_graceful_close(void)
+{
+    char large[66000];
+    memset(large, 'a', sizeof(large));
+    setup();
+    send_text(client_peer, "GET / HTTP/1.1\r\nX-Large: ");
+    send_bytes(client_peer, large, sizeof(large));
+    expect_status(client_peer, "HTTP/1.1 431 ");
+    CHECK(server.connections && server.connections->state == CLOSING);
+    CHECK(server.connections->client_shutdown);
+    CHECK(!evbuffer_get_length(bufferevent_get_input(server.connections->client)));
+    /* Data still in flight must be discarded after the response is sent. */
+    send_bytes(client_peer, large, sizeof(large));
+    CHECK(!evbuffer_get_length(bufferevent_get_input(server.connections->client)));
+    CHECK(!connect_count);
+    expect_graceful_close();
+    teardown();
+
+    /* Incoming data must not extend the deadline for releasing a connection. */
+    setup();
+    request("GET", "http://example.test/", "", "");
+    expect_status(client_peer, "HTTP/1.1 407 ");
+    struct timeval deadline, after_input;
+    CHECK(evtimer_pending(server.connections->close_timer, &deadline));
+    send_text(client_peer, "extra input");
+    CHECK(evtimer_pending(server.connections->close_timer, &after_input));
+    CHECK(deadline.tv_sec == after_input.tv_sec && deadline.tv_usec == after_input.tv_usec);
+    event_active(server.connections->close_timer, EV_TIMEOUT, 0);
+    pump();
+    CHECK(!server.connections);
+    teardown();
+
+    /* A client's FIN must not discard an error response still waiting to write. */
+    setup();
+    bufferevent_disable(client_peer, EV_READ);
+    request("GET", "http://example.test/", "", "");
+    CHECK(server.connections && !server.connections->client_shutdown);
+    CHECK(!evtimer_pending(server.connections->close_timer, NULL));
+    bufferevent_trigger_event(server.connections->client, BEV_EVENT_EOF, BEV_TRIG_DEFER_CALLBACKS);
+    pump();
+    CHECK(server.connections && !server.connections->client_shutdown);
+    bufferevent_enable(client_peer, EV_READ);
+    pump();
+    expect_status(client_peer, "HTTP/1.1 407 ");
+    CHECK(!server.connections);
     teardown();
 }
 
@@ -431,7 +488,7 @@ static void test_half_close_and_failures(void)
     bufferevent_trigger_event(server.connections->upstream, BEV_EVENT_EOF, BEV_TRIG_DEFER_CALLBACKS);
     pump();
     expect_text(client_peer, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort");
-    CHECK(!server.connections);
+    expect_graceful_close();
     teardown();
 
     setup();
@@ -439,14 +496,14 @@ static void test_half_close_and_failures(void)
     bufferevent_trigger_event(server.connections->upstream, BEV_EVENT_TIMEOUT, BEV_TRIG_DEFER_CALLBACKS);
     pump();
     expect_status(client_peer, "HTTP/1.1 504 ");
-    CHECK(!server.connections);
+    expect_graceful_close();
     teardown();
 
     setup();
     request("GET", "http://example.test/", authorization, "");
     send_text(upstream_peer, "invalid-response\r\n\r\n");
     expect_status(client_peer, "HTTP/1.1 502 ");
-    CHECK(!server.connections);
+    expect_graceful_close();
     teardown();
 }
 
@@ -486,6 +543,7 @@ static void test_fragmentation_and_live_reload(void)
 
 int main(void)
 {
+    test_graceful_close();
     test_http_auth();
     test_http_framing();
     test_invalid_http();
